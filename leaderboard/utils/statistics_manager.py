@@ -172,9 +172,10 @@ class StatisticsManager(object):
                             route_record.infractions['route_dev'].append(event.get_message())
                             failure = "Agent deviated from the route"
 
-                        elif event.get_type() == TrafficEventType.STOP_INFRACTION:
-                            score_penalty *= PENALTY_STOP
-                            route_record.infractions['stop_infraction'].append(event.get_message())
+                        # since the leaderboard also didn't include the stop infraction in the result shown
+                        # elif event.get_type() == TrafficEventType.STOP_INFRACTION:
+                        #     score_penalty *= PENALTY_STOP
+                        #     route_record.infractions['stop_infraction'].append(event.get_message())
 
                         elif event.get_type() == TrafficEventType.VEHICLE_BLOCKED:
                             route_record.infractions['vehicle_blocked'].append(event.get_message())

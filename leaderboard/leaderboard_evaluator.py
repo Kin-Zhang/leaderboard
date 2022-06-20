@@ -263,6 +263,11 @@ class LeaderboardEvaluator(object):
             agent_class_name = getattr(self.module_agent, 'get_entry_point')()
             if 'route_id' in args.agent_config:
                 args.agent_config.route_id = int(config.name.split('_')[1].split('/')[0])
+
+            if 'route_file' in args.agent_config:
+                args.agent_config.route_file = []
+                for tra in config.trajectory:
+                    args.agent_config.route_file.append([tra.x,tra.y,tra.z])
             self.agent_instance = getattr(self.module_agent, agent_class_name)(args.agent_config)
             config.agent = self.agent_instance
 
