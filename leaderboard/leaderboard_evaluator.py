@@ -43,7 +43,9 @@ sensors_to_icons = {
     'sensor.other.gnss':        'carla_gnss',
     'sensor.other.imu':         'carla_imu',
     'sensor.opendrive_map':     'carla_opendrive_map',
-    'sensor.speedometer':       'carla_speedometer'
+    'sensor.speedometer':       'carla_speedometer',
+    # Training sensors
+    'sensor.camera.semantic_segmentation':        'carla_sem',
 }
 
 
@@ -259,6 +261,8 @@ class LeaderboardEvaluator(object):
         try:
             self._agent_watchdog.start()
             agent_class_name = getattr(self.module_agent, 'get_entry_point')()
+            if 'route_id' in args.agent_config:
+                args.agent_config.route_id = int(config.name.split('_')[1].split('/')[0])
             self.agent_instance = getattr(self.module_agent, agent_class_name)(args.agent_config)
             config.agent = self.agent_instance
 
