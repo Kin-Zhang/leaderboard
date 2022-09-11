@@ -34,18 +34,18 @@ from srunner.scenariomanager.scenarioatomics.atomic_criteria import (CollisionTe
                                                                      RunningRedLightTest,
                                                                      RunningStopTest,
                                                                      ActorBlockedTest,
-                                                                     CheckMinSpeed)
+                                                                     MinimumSpeedRouteTest)
 
 from srunner.scenarios.basic_scenario import BasicScenario
-from srunner.scenarios.background_activity import BackgroundActivity
+from srunner.scenarios.background_activity import BackgroundBehavior
 from srunner.scenariomanager.weather_sim import RouteWeatherBehavior
 from srunner.scenariomanager.lights_sim import RouteLightsBehavior
+from srunner.scenariomanager.timer import RouteTimeoutBehavior
 
 from leaderboard.utils.route_parser import RouteParser, DIST_THRESHOLD
 from leaderboard.utils.route_manipulation import interpolate_trajectory
 
-SECONDS_GIVEN_PER_METERS = 0.8
-INITIAL_SECONDS_DELAY = 5.0
+import leaderboard.scenarios.parked_vehicles as parked_vehicles
 
 
 class RouteScenario(BasicScenario):
@@ -63,20 +63,24 @@ class RouteScenario(BasicScenario):
         """
         self.config = config
         self.route = self._get_route(config)
+        self.list_scenarios = []
         sampled_scenario_definitions = self._filter_scenarios(config.scenario_configs)
 
-        ego_vehicle = self._spawn_ego_vehicle()
-        self.timeout = self._estimate_route_timeout()
+        ego_vehicle = self._spawn_ego_vehicle(world)
+        if ego_vehicle is None:
+            raise ValueError("Shutting down, couldn't spawn the ego vehicle")
 
         if debug_mode>0:
-            self._draw_waypoints(world, self.route, vertical_shift=0.1, size=0.1, persistency=self.timeout)
+            self._draw_waypoints(world, self.route, vertical_shift=0.1, size=0.05, persistency=10000)
 
         self._build_scenarios(
-            world, ego_vehicle, sampled_scenario_definitions, timeout=self.timeout, debug=debug_mode > 0
+            world, ego_vehicle, sampled_scenario_definitions, timeout=10000, debug=debug_mode > 0
         )
 
+        self._spawn_parked_vehicles()
+
         super(RouteScenario, self).__init__(
-            config.name, [ego_vehicle], config, world, debug_mode > 1, False, criteria_enable
+            config.name, [ego_vehicle], config, world, debug_mode > 3, False, criteria_enable
         )
 
     def _get_route(self, config):
@@ -91,9 +95,8 @@ class RouteScenario(BasicScenario):
         """
 
         # prepare route's trajectory (interpolate and add the GPS route)
-        gps_route, route = interpolate_trajectory(config.keypoints)
-        config.agent.set_global_plan(gps_route, route)
-        return route
+        self.gps_route, self.route = interpolate_trajectory(config.keypoints)
+        return self.route
 
     def _filter_scenarios(self, scenario_configs):
         """
@@ -114,37 +117,74 @@ class RouteScenario(BasicScenario):
 
         return new_scenarios_config
 
-    def _spawn_ego_vehicle(self):
+    def _spawn_ego_vehicle(self, world):
         """Spawn the ego vehicle at the first waypoint of the route"""
         elevate_transform = self.route[0][0]
         elevate_transform.location.z += 0.5
 
-        ego_vehicle = CarlaDataProvider.request_new_actor('vehicle.lincoln.mkz_2017',
+        ego_vehicle = CarlaDataProvider.request_new_actor('vehicle.lincoln.mkz_2020',
                                                           elevate_transform,
                                                           rolename='hero')
-
+        if not ego_vehicle:
+            return
 
         spectator = CarlaDataProvider.get_world().get_spectator()
-        ego_trans = ego_vehicle.get_transform()
-        spectator.set_transform(carla.Transform(ego_trans.location + carla.Location(z=50),
+        spectator.set_transform(carla.Transform(elevate_transform.location + carla.Location(z=50),
                                                     carla.Rotation(pitch=-90)))
+
+        world.tick()
 
         return ego_vehicle
 
-    def _estimate_route_timeout(self):
-        """
-        Estimate the duration of the route, as a proportinal value of its length
-        """
-        route_length = 0.0  # in meters
+    def _spawn_parked_vehicles(self):
+        """Spawn parked vehicles."""
+        SpawnActor = carla.command.SpawnActor
 
-        prev_point = self.route[0][0]
-        for current_point, _ in self.route[1:]:
-            dist = current_point.location.distance(prev_point.location)
-            route_length += dist
-            prev_point = current_point
+        min_x, min_y = float('inf'), float('inf')
+        max_x, max_y = float('-inf'), float('-inf')
+        for route_transform, _ in self.route:
+            min_x = min(min_x, route_transform.location.x - 100)
+            min_y = min(min_y, route_transform.location.y - 100)
 
-        print(f"ROUTE LENGTH: {route_length}")
-        return int(SECONDS_GIVEN_PER_METERS * route_length + INITIAL_SECONDS_DELAY)
+            max_x = max(max_x, route_transform.location.x + 100)
+            max_y = max(max_y, route_transform.location.y + 100)
+
+        # Occupied parking locations
+        all_occupied_parking_locations = []
+        for scenario in self.list_scenarios:
+            all_occupied_parking_locations.extend(scenario.get_parking_slots())
+
+        all_available_parking_slots = []
+        map_name = CarlaDataProvider.get_map().name.split('/')[-1]
+        if map_name == "Town12":
+            all_available_parking_slots = parked_vehicles.Town12
+
+        batch = []
+        for slot in all_available_parking_slots:
+            slot_transform = carla.Transform(
+                location=carla.Location(slot["location"][0], slot["location"][1], slot["location"][2]),
+                rotation=carla.Rotation(slot["rotation"][0], slot["rotation"][1], slot["rotation"][2])
+            )
+            mesh_path = slot["mesh"]
+
+            if not (min_x < slot_transform.location.x < max_x) or not (min_y < slot_transform.location.y < max_y):
+                continue
+
+            is_free = True
+            for occupied_slot in all_occupied_parking_locations:
+                distance = slot_transform.location.distance(occupied_slot)
+                if distance < 10:
+                    is_free = False
+                    break;
+            if is_free:
+                mesh_bp = CarlaDataProvider.get_world().get_blueprint_library().filter("static.prop.mesh")[0]
+                mesh_bp.set_attribute("mesh_path", mesh_path)
+                mesh_bp.set_attribute("scale", "0.9")
+                batch.append(SpawnActor(mesh_bp, slot_transform))
+            else:
+                pass
+
+        CarlaDataProvider.get_client().apply_batch_sync(batch)
 
     # pylint: disable=no-self-use
     def _draw_waypoints(self, world, waypoints, vertical_shift, size, persistency=-1):
@@ -167,7 +207,8 @@ class RouteScenario(BasicScenario):
             else:  # LANEFOLLOW
                 color = carla.Color(0, 128, 0)  # Green
 
-            world.debug.draw_point(wp, size=0.1, color=color, life_time=persistency)
+            world.debug.draw_point(wp, size=size, color=color, life_time=persistency)
+
 
         world.debug.draw_point(waypoints[0][0].location + carla.Location(z=vertical_shift), size=2*size,
                                color=carla.Color(0, 0, 128), life_time=persistency)
@@ -234,7 +275,7 @@ class RouteScenario(BasicScenario):
             for scenario_config in scenario_definitions:
                 scenario_loc = scenario_config.trigger_points[0].location
                 debug_loc = tmap.get_waypoint(scenario_loc).transform.location + carla.Location(z=0.2)
-                world.debug.draw_point(debug_loc, size=0.2, color=carla.Color(128, 0, 0), life_time=timeout)
+                world.debug.draw_point(debug_loc, size=0.1, color=carla.Color(128, 0, 0), life_time=timeout)
                 world.debug.draw_string(debug_loc, str(scenario_config.name), draw_shadow=False,
                                         color=carla.Color(0, 0, 128), life_time=timeout, persistent_lines=True)
 
@@ -252,10 +293,10 @@ class RouteScenario(BasicScenario):
                     world.tick()
 
             except Exception as e:
-                if not debug:
-                    print("Skipping scenario '{}' due to setup error: {}".format(scenario_config.type, e))
-                else:
-                    traceback.print_exc()
+                print(f"\033[93mSkipping scenario '{scenario_config.name}' due to setup error: {e}")
+                if debug:
+                    print(f"\n{traceback.format_exc()}")
+                print("\033[0m", end="")
                 continue
 
             self.list_scenarios.append(scenario_instance)
@@ -294,15 +335,11 @@ class RouteScenario(BasicScenario):
 
         # Add the behavior that manages the scenario trigger conditions
         scenario_triggerer = ScenarioTriggerer(
-            self.ego_vehicles[0], self.route, blackboard_list, scenario_trigger_distance, repeat_scenarios=False
-        )
+            self.ego_vehicles[0], self.route, blackboard_list, scenario_trigger_distance)
         behavior.add_child(scenario_triggerer)  # Tick the ScenarioTriggerer before the scenarios
 
         # Add the Background Activity
-        background_activity = BackgroundActivity(
-            self.world, self.ego_vehicles[0], self.config, self.route, timeout=self.timeout
-        )
-        behavior.add_child(background_activity.behavior_tree)
+        behavior.add_child(BackgroundBehavior(self.ego_vehicles[0], self.route, name="BackgroundActivity"))
 
         behavior.add_children(scenario_behaviors)
         return behavior
@@ -320,12 +357,10 @@ class RouteScenario(BasicScenario):
 
         # 'Normal' criteria
         criteria.add_child(OutsideRouteLanesTest(self.ego_vehicles[0], route=self.route))
-        criteria.add_child(CollisionTest(self.ego_vehicles[0], other_actor_type='vehicle', name="CollisionVehicleTest"))
-        criteria.add_child(CollisionTest(self.ego_vehicles[0], other_actor_type='miscellaneous', name="CollisionLayoutTest"))
-        criteria.add_child(CollisionTest(self.ego_vehicles[0], other_actor_type='walker', name="CollisionPedestrianTest"))
+        criteria.add_child(CollisionTest(self.ego_vehicles[0], name="CollisionTest"))
         criteria.add_child(RunningRedLightTest(self.ego_vehicles[0]))
         criteria.add_child(RunningStopTest(self.ego_vehicles[0]))
-        criteria.add_child(CheckMinSpeed(self.ego_vehicles[0], name="MinSpeedTest"))
+        criteria.add_child(MinimumSpeedRouteTest(self.ego_vehicles[0], self.route, checkpoints=4, name="MinSpeedTest"))
 
         # These stop the route early to save computational time
         criteria.add_child(InRouteTest(
@@ -347,17 +382,23 @@ class RouteScenario(BasicScenario):
 
     def _create_weather_behavior(self):
         """
-        If needed, add the dynamic weather behavior to the route
+        Create the weather behavior
         """
         if len(self.config.weather) == 1:
-            return
+            return  # Just set the weather at the beginning and done
         return RouteWeatherBehavior(self.ego_vehicles[0], self.route, self.config.weather)
 
     def _create_lights_behavior(self):
         """
-        Create the light behavior
+        Create the street lights behavior
         """
         return RouteLightsBehavior(self.ego_vehicles[0], 100)
+
+    def _create_timeout_behavior(self):
+        """
+        Create the timeout behavior
+        """
+        return RouteTimeoutBehavior(self.ego_vehicles[0], self.route)
 
     def _initialize_environment(self, world):
         """

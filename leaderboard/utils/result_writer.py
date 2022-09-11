@@ -85,14 +85,13 @@ class ResultOutputProvider(object):
         for criterion in self._data.scenario.get_criteria():
 
             name = criterion.name
-            # If two criterion have the same name, their results are shown as one
+
             if name in criteria_data:
                 result = criterion.test_status
                 if STATUS_PRIORITY[result] < STATUS_PRIORITY[criteria_data[name]['result']]:
                     criteria_data[name]['result'] = result
                 criteria_data[name]['actual_value'] += criterion.actual_value
-                # TODO: Check the units (and do something about the criterion if the fail to match)
- 
+
             else:
                 criteria_data[name] = {
                     'result': criterion.test_status,

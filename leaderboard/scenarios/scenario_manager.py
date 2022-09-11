@@ -22,7 +22,7 @@ from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 from srunner.scenariomanager.timer import GameTime
 from srunner.scenariomanager.watchdog import Watchdog
 
-from leaderboard.autoagents.agent_wrapper import AgentWrapper, AgentError
+from leaderboard.autoagents.agent_wrapper import AgentWrapperFactory, AgentError
 from leaderboard.envs.sensor_interface import SensorReceivedNoData
 from leaderboard.utils.result_writer import ResultOutputProvider
 
@@ -45,29 +45,32 @@ class ScenarioManager(object):
     """
 
 
-    def __init__(self, timeout, debug_mode=False):
+    def __init__(self, timeout, statistics_manager, debug_mode=0):
         """
         Setups up the parameters, which will be filled at load_scenario()
         """
+        self.config = None
         self.scenario = None
         self.scenario_tree = None
         self.ego_vehicles = None
         self.other_actors = None
 
         self._debug_mode = debug_mode
-        self._agent = None
+        self._agent_wrapper = None
         self._running = False
         self._timestamp_last_run = 0.0
         self._timeout = float(timeout)
 
         self.scenario_duration_system = 0.0
         self.scenario_duration_game = 0.0
-        self.start_system_time = None
-        self.end_system_time = None
-        self.end_game_time = None
+        self.start_system_time = 0.0
+        self.end_system_time = 0.0
+        self.end_game_time = 0.0
 
         self._watchdog = None
         self._agent_watchdog = None
+
+        self._statistics_manager = statistics_manager
 
         # Use the callback_id inside the signal handler to allow external interrupts
         signal.signal(signal.SIGINT, self.signal_handler)
@@ -89,21 +92,22 @@ class ScenarioManager(object):
         self._timestamp_last_run = 0.0
         self.scenario_duration_system = 0.0
         self.scenario_duration_game = 0.0
-        self.start_system_time = None
-        self.end_system_time = None
-        self.end_game_time = None
+        self.start_system_time = 0.0
+        self.end_system_time = 0.0
+        self.end_game_time = 0.0
 
         self._spectator = None
         self._watchdog = None
         self._agent_watchdog = None
 
-    def load_scenario(self, scenario, agent, rep_number):
+    def load_scenario(self, config, scenario, agent, rep_number):
         """
         Load a new scenario
         """
 
         GameTime.restart()
-        self._agent = AgentWrapper(agent)
+        self._agent_wrapper = AgentWrapperFactory.get_wrapper(agent)
+        self.config = config
         self.scenario = scenario
         self.scenario_tree = scenario.scenario_tree
         self.ego_vehicles = scenario.ego_vehicles
@@ -115,7 +119,7 @@ class ScenarioManager(object):
         # To print the scenario tree uncomment the next line
         # py_trees.display.render_dot_tree(self.scenario_tree)
 
-        self._agent.setup_sensors(self.ego_vehicles[0], self._debug_mode)
+        self._agent_wrapper.setup_sensors(self.ego_vehicles[0])
 
     def run_scenario(self):
         """
@@ -135,19 +139,16 @@ class ScenarioManager(object):
         self._running = True
 
         while self._running:
-            timestamp = None
-            world = CarlaDataProvider.get_world()
-            if world:
-                snapshot = world.get_snapshot()
-                if snapshot:
-                    timestamp = snapshot.timestamp
-            if timestamp:
-                self._tick_scenario(timestamp)
+            self._tick_scenario()
 
-    def _tick_scenario(self, timestamp):
+    def _tick_scenario(self):
         """
         Run next tick of scenario and the agent and tick the world.
         """
+        if self._running and self.get_running_status():
+            CarlaDataProvider.get_world().tick(self._timeout)
+
+        timestamp = CarlaDataProvider.get_world().get_snapshot().timestamp
 
         if self._timestamp_last_run < timestamp.elapsed_seconds and self._running:
             self._timestamp_last_run = timestamp.elapsed_seconds
@@ -161,7 +162,7 @@ class ScenarioManager(object):
             try:
                 self._agent_watchdog.resume()
                 self._agent_watchdog.update()
-                ego_action = self._agent()
+                ego_action = self._agent_wrapper()
                 self._agent_watchdog.pause()
 
             # Special exception inside the agent that isn't caused by the agent
@@ -174,10 +175,28 @@ class ScenarioManager(object):
             self._watchdog.resume()
             self.ego_vehicles[0].apply_control(ego_action)
 
-            # Tick scenario
+            # Tick scenario. Add the ego control to the blackboard in case some behaviors want to change it
+            py_trees.blackboard.Blackboard().set("AV_control", ego_action, overwrite=True)
             self.scenario_tree.tick_once()
 
-            if self._debug_mode:
+            if self._debug_mode > 1:
+                self.compute_duration_time()
+
+                # Update live statistics
+                self._statistics_manager.compute_route_statistics(
+                    self.config,
+                    self.scenario_duration_system,
+                    self.scenario_duration_game,
+                    failure_message=""
+                )
+                self._statistics_manager.write_live_results(
+                    self.config.index,
+                    self.ego_vehicles[0].get_velocity().length(),
+                    ego_action,
+                    self.ego_vehicles[0].get_location()
+                )
+
+            if self._debug_mode > 2:
                 print("\n")
                 py_trees.display.print_ascii_tree(
                     self.scenario_tree, show_status=True)
@@ -187,11 +206,8 @@ class ScenarioManager(object):
                 self._running = False
 
             ego_trans = self.ego_vehicles[0].get_transform()
-            self._spectator.set_transform(carla.Transform(ego_trans.location + carla.Location(z=80),
+            self._spectator.set_transform(carla.Transform(ego_trans.location + carla.Location(z=70),
                                                           carla.Rotation(pitch=-90)))
-
-        if self._running and self.get_running_status():
-            CarlaDataProvider.get_world().tick(self._timeout)
 
     def get_running_status(self):
         """
@@ -212,21 +228,27 @@ class ScenarioManager(object):
         if self._agent_watchdog:
             self._agent_watchdog.stop()
 
-        self.end_system_time = time.time()
-        self.end_game_time = GameTime.get_time()
-
-        self.scenario_duration_system = self.end_system_time - self.start_system_time
-        self.scenario_duration_game = self.end_game_time - self.start_game_time
+        self.compute_duration_time()
 
         if self.get_running_status():
             if self.scenario is not None:
                 self.scenario.terminate()
 
-            if self._agent is not None:
-                self._agent.cleanup()
-                self._agent = None
+            if self._agent_wrapper is not None:
+                self._agent_wrapper.cleanup()
+                self._agent_wrapper = None
 
             self.analyze_scenario()
+
+    def compute_duration_time(self):
+        """
+        Computes system and game duration times
+        """
+        self.end_system_time = time.time()
+        self.end_game_time = GameTime.get_time()
+
+        self.scenario_duration_system = self.end_system_time - self.start_system_time
+        self.scenario_duration_game = self.end_game_time - self.start_game_time
 
     def analyze_scenario(self):
         """
